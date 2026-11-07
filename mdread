@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""
+mdread - Fast, clean CLI Markdown Reader with instant one-click command copying.
+"""
+
+import sys
+import os
+import re
+import argparse
+import subprocess
+import shutil
+
+def copy_to_clipboard(text: str) -> bool:
+    """Copy text to system clipboard via wl-copy, xclip, and OSC 52."""
+    clean_text = text.strip()
+    success = False
+
+    # 1. Wayland
+    if shutil.which("wl-copy"):
+        try:
+            subprocess.run(
+                ["wl-copy"],
+                input=clean_text.encode("utf-8"),
+                check=True,
+                timeout=0.5,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            success = True
+        except Exception:
+            pass
+
+    # 2. X11
+    if not success and shutil.which("xclip"):
+        try:
+            subprocess.run(
+                ["xclip", "-selection", "clipboard"],
+                input=clean_text.encode("utf-8"),
+                check=True,
+                timeout=0.5,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            success = True
+        except Exception:
+            pass
+
+    # 3. OSC 52 terminal sequence (works across SSH, tmux, and modern terminals)
+    try:
+        import base64
+        b64 = base64.b64encode(clean_text.encode("utf-8")).decode("utf-8")
+        sys.stdout.write(f"\033]52;c;{b64}\a")
+        sys.stdout.flush()
+        success = True
+    except Exception:
+        pass
+
+    return success
+
+def extract_code_blocks(content: str):
+    """Extract code blocks with their language and content."""
+    pattern = re.compile(r'```([a-zA-Z0-9_-]*)\n(.*?)```', re.DOTALL)
+    blocks = []
+    for match in pattern.finditer(content):
+        lang = match.group(1).strip() or "shell"
+        code = match.group(2).strip()
+        if code:
+            blocks.append((lang, code))
+    return blocks
+
+def run_command_picker(content: str, filename: str):
+    """Interactive mode to list and copy any command block by number."""
+    blocks = extract_code_blocks(content)
+    if not blocks:
+        print(f"\n[INFO] No code blocks or commands found in '{filename}'.")
+        sys.exit(0)
+
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        from rich.panel import Panel
+        from rich.syntax import Syntax
+
+        console = Console()
+        console.print(Panel(f"[bold cyan]{filename}[/bold cyan] -- Select a command to copy", border_style="cyan"))
+
+        table = Table(show_header=True, header_style="bold magenta", box=None, padding=(0, 1))
+        table.add_column("#", style="bold yellow", width=4)
+        table.add_column("Type", style="dim cyan", width=10)
+        table.add_column("Command / Code Snippet", style="white")
+
+        for idx, (lang, code) in enumerate(blocks, start=1):
+            first_lines = "\n".join(code.splitlines()[:3])
+            if len(code.splitlines()) > 3:
+                first_lines += "\n..."
+            syntax = Syntax(first_lines, lang or "bash", theme="monokai", background_color="default")
+            table.add_row(f"[{idx}]", f"[{lang}]", syntax)
+
+        console.print(table)
+        console.print("\nEnter command number to copy (or 'q' to exit): ", end="")
+
+        choice = input().strip()
+        if choice.lower() in ("q", "quit", "exit", ""):
+            sys.exit(0)
+
+        num = int(choice)
+        if 1 <= num <= len(blocks):
+            selected_code = blocks[num - 1][1]
+            copy_to_clipboard(selected_code)
+            console.print(f"\n[bold green][OK] Copied command [{num}] to clipboard.[/bold green] Ready to paste (Ctrl+V).\n")
+        else:
+            print("Invalid choice.")
+    except (ValueError, IndexError):
+        print("Invalid number.")
+    except (KeyboardInterrupt, EOFError):
+        print()
+    sys.exit(0)
+
+def run_tui(content: str, filename: str):
+    """Fast, smooth interactive reader with clickable text [COPY] button and NO sidebar palette."""
+    try:
+        from textual.app import App, ComposeResult
+        from textual.widgets import Markdown, Button, Label, Footer
+        from textual.widgets._markdown import MarkdownFence
+        from textual.containers import Horizontal, VerticalScroll
+    except ImportError:
+        run_rich_render(content, filename)
+        return
+
+    class CopyableMarkdownFence(MarkdownFence):
+        DEFAULT_CSS = """
+        CopyableMarkdownFence {
+            margin: 1 0;
+            width: 1fr;
+            height: auto;
+            background: #181825;
+            border: solid #3b82f6;
+            padding: 0;
+        }
+        .fence-header {
+            dock: top;
+            height: 1;
+            background: #24273a;
+            padding: 0 1;
+        }
+        .lang-label {
+            dock: left;
+            color: #93c5fd;
+            text-style: bold;
+        }
+        .copy-btn {
+            dock: right;
+            min-width: 8;
+            height: 1;
+            border: none;
+            padding: 0 1;
+            background: #00e5ff;
+            color: #000000;
+            text-style: bold;
+        }
+        .copy-btn:hover {
+            background: #38bdf8;
+            color: #000000;
+        }
+        """
+
+        def compose(self) -> ComposeResult:
+            with Horizontal(classes="fence-header"):
+                lang = self.lexer.strip() if self.lexer else "CODE"
+                yield Label(f"[{lang.upper()}]", classes="lang-label")
+                yield Button("COPY", id="btn-copy", classes="copy-btn")
+            yield Label(self._highlighted_code, id="code-content", expand=True)
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            event.stop()
+            text_to_copy = self.code.rstrip("\n")
+            self.app.copy_to_clipboard(text_to_copy)
+            copy_to_clipboard(text_to_copy)
+
+            btn = self.query_one("#btn-copy", Button)
+            btn.label = "COPIED"
+            btn.styles.background = "#22c55e"
+            btn.styles.color = "#000000"
+            self.set_timer(2.0, self._reset_button)
+            self.app.notify("Copied command to clipboard. Ready to paste (Ctrl+V).", timeout=2.0)
+
+        def _reset_button(self) -> None:
+            try:
+                btn = self.query_one("#btn-copy", Button)
+                btn.label = "COPY"
+                btn.styles.background = "#00e5ff"
+                btn.styles.color = "#000000"
+            except Exception:
+                pass
+
+    Markdown.BLOCKS["fence"] = CopyableMarkdownFence
+    Markdown.BLOCKS["code_block"] = CopyableMarkdownFence
+
+    class FastReaderApp(App):
+        TITLE = f"mdread -- {filename}"
+        BINDINGS = [
+            ("q", "quit", "Quit"),
+        ]
+        CSS = """
+        Screen {
+            background: #11111b;
+        }
+        #reader-scroll {
+            width: 1fr;
+            height: 1fr;
+            padding: 1 2;
+        }
+        Markdown {
+            margin: 0;
+            padding: 0;
+        }
+        """
+
+        def compose(self) -> ComposeResult:
+            with VerticalScroll(id="reader-scroll"):
+                yield Markdown(content)
+            yield Footer()
+
+    app = FastReaderApp()
+    try:
+        app.run()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+
+def run_rich_render(content: str, filename: str):
+    """Clean fallback console renderer."""
+    try:
+        from rich.console import Console
+        from rich.markdown import Markdown
+        from rich.panel import Panel
+        from rich.text import Text
+    except ImportError:
+        print(content)
+        return
+
+    console = Console()
+    header_text = Text()
+    header_text.append(f"File: {filename}  ", style="bold cyan")
+    header_text.append("-- (Tip: run 'mdread -c' to pick and copy commands)", style="dim white")
+    console.print(Panel(header_text, border_style="blue", padding=(0, 1)))
+
+    md = Markdown(content, code_theme="monokai", hyperlinks=True)
+    try:
+        with console.pager(styles=True):
+            console.print(md)
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="mdread",
+        description="Fast CLI Markdown reader with one-click command copying."
+    )
+    parser.add_argument("file", nargs="?", help="Path to markdown file (or stdin)")
+    parser.add_argument("-c", "--copy", action="store_true", help="Command picker: pick and copy any command")
+    parser.add_argument("--no-pager", "--cli", action="store_true", help="Print directly without interactive viewer")
+    args = parser.parse_args()
+
+    # Read content
+    if args.file and args.file != "-":
+        if not os.path.exists(args.file):
+            sys.stderr.write(f"Error: File '{args.file}' not found.\n")
+            sys.exit(1)
+        filename = os.path.basename(args.file)
+        with open(args.file, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    else:
+        if sys.stdin.isatty():
+            parser.print_help()
+            sys.exit(1)
+        filename = "Standard Input"
+        content = sys.stdin.read()
+
+    # Mode 1: Command picker
+    if args.copy:
+        run_command_picker(content, filename)
+        return
+
+    # Mode 2: Direct output (piped or --no-pager)
+    if args.no_pager or not sys.stdin.isatty():
+        run_rich_render(content, filename)
+        return
+
+    # Mode 3: Fast smooth TUI reader (no side palette, no emojis)
+    run_tui(content, filename)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, BrokenPipeError):
+        sys.exit(0)
