@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 mdread - Fast, clean CLI Markdown Reader with instant one-click command copying.
+Author: ben-slates (https://github.com/ben-slates)
 """
 
 import sys

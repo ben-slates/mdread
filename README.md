@@ -59,3 +59,16 @@ To remove system-wide install:
 ```bash
 sudo ./uninstall.sh
 ```
+
+---
+
+## Author & Contributor
+
+* **ben-slates** — [GitHub Profile](https://github.com/ben-slates)
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
